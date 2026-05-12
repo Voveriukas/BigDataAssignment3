@@ -149,7 +149,7 @@ The script:
 
 ### Filters applied during loading
 
- Arow is inserted only if:
+ A row is inserted only if:
 
 - `Type of mobile` equals `Class A`.
 - MMSI parses as a number.
@@ -384,8 +384,6 @@ The dominant spike at 10 seconds matches the IMO Class A requirement for vessels
 | `--workers` | `config.NUM_WORKERS` | Worker process count |
 | `--batch-size` | `50` | MMSIs per worker batch |
 | `--output` | `delta_t_histogram.png` | Output filename base |
-
---
 
 ## Full workflow
 
