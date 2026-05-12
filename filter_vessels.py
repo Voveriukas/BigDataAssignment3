@@ -4,7 +4,7 @@ Every document in vessels_clean must have all required fields:
 mmsi, lat, lon, sog, cog, heading, rot, nav_status.
 
 Strategy:
-  1. create raw collection indexes by default.
+  1. Create raw collection indexes.
   2. Find valid MMSIs in parallel.
   3. Reset vessels_clean.
   4. Shard vessels_clean by hashed mmsi if running through mongos.
@@ -68,18 +68,9 @@ def required_field_conditions() -> dict:
     }
 
 
-def format_number(value) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value:,}"
-
-
 def aggregate_raw(pipeline: list, use_hint: bool = True) -> list:
     """
     Runs aggregation on vessels_raw.
-
-    If a hint is available, tries it first.
-    If Mongo rejects the hint, retries without hint.
     """
     kwargs = {"allowDiskUse": True}
 
@@ -180,6 +171,16 @@ def ensure_raw_indexes(
     except OperationFailure as e:
         log.warning("Could not create index mmsi_ts: %s", e)
 
+    try:
+        col.create_index(
+            [("ts", ASCENDING)],
+            name="ts_only",
+        )
+        log.info("Created or confirmed index: ts_only")
+
+    except OperationFailure as e:
+        log.warning("Could not create index ts_only: %s", e)
+
     elapsed = time.perf_counter() - t0
     client.close()
 
@@ -203,56 +204,7 @@ def choose_count_hint(
     return None
 
 
-# -- Step 1A: raw count mode --------------------------------------------------
-
-def find_valid_mmsis_raw_single(
-    uri: str,
-    db_name: str,
-    raw_col: str,
-    min_pings: int,
-) -> list[int]:
-    """
-    Faster but less strict.
-
-    Counts all raw pings per vessel.
-    Missing required fields are still removed later during filtering.
-    """
-    client = MongoClient(uri)
-    col = client[db_name][raw_col]
-
-    t0 = time.perf_counter()
-
-    try:
-        estimated_docs = col.estimated_document_count()
-        log.info("Raw collection estimated documents: %s", f"{estimated_docs:,}")
-    except Exception:
-        log.info("Raw collection estimated documents: unavailable")
-
-    log.info("Finding vessels with >= %d raw pings...", min_pings)
-
-    pipeline = [
-        {"$group": {"_id": "$mmsi", "count": {"$sum": 1}}},
-        {"$match": {"count": {"$gte": min_pings}}},
-        {"$sort": {"_id": 1}},
-    ]
-
-    docs = list(col.aggregate(pipeline, allowDiskUse=True))
-    mmsis = [d["_id"] for d in docs]
-
-    elapsed = time.perf_counter() - t0
-    client.close()
-
-    log.info(
-        "Found %d vessels with >= %d raw pings in %.1f s",
-        len(mmsis),
-        min_pings,
-        elapsed,
-    )
-
-    return mmsis
-
-
-# -- Step 1B: parallel valid count mode ---------------------------------------
+# -- Step 1: parallel valid count mode ----------------------------------------
 
 def worker_count_valid_mmsis(args: tuple) -> dict:
     batch_id, mmsi_batch, min_pings = args
@@ -307,8 +259,6 @@ def find_valid_mmsis_parallel(
     hint_name: str | None,
 ) -> list[int]:
     """
-    Strict mode.
-
     Counts only pings with all required fields.
     The counting stage is split by MMSI batches and run in parallel.
     """
@@ -434,7 +384,6 @@ def reset_clean_collection(
     uri: str,
     db_name: str,
     clean_col: str,
-    shard_clean: bool,
 ) -> None:
     client = MongoClient(uri)
     db = client[db_name]
@@ -448,27 +397,26 @@ def reset_clean_collection(
     except CollectionInvalid:
         log.info("%s already exists", clean_col)
 
-    if shard_clean:
-        namespace = f"{db_name}.{clean_col}"
+    namespace = f"{db_name}.{clean_col}"
 
-        try:
-            log.info("Trying to shard %s by hashed mmsi...", namespace)
-            client.admin.command(
-                "shardCollection",
-                namespace,
-                key={"mmsi": "hashed"},
-            )
-            log.info("%s sharded by hashed mmsi", namespace)
+    try:
+        log.info("Trying to shard %s by hashed mmsi...", namespace)
+        client.admin.command(
+            "shardCollection",
+            namespace,
+            key={"mmsi": "hashed"},
+        )
+        log.info("%s sharded by hashed mmsi", namespace)
 
-        except OperationFailure as e:
-            message = str(e)
+    except OperationFailure as e:
+        message = str(e)
 
-            if "already sharded" in message.lower():
-                log.info("%s is already sharded", namespace)
-            elif "no such command" in message.lower():
-                log.info("Sharding skipped. This does not look like mongos.")
-            else:
-                log.warning("Sharding skipped: %s", e)
+        if "already sharded" in message.lower():
+            log.info("%s is already sharded", namespace)
+        elif "no such command" in message.lower():
+            log.info("Sharding skipped. This does not look like mongos.")
+        else:
+            log.warning("Sharding skipped: %s", e)
 
     client.close()
 
@@ -505,37 +453,24 @@ def create_clean_indexes(uri: str, db_name: str, clean_col: str) -> None:
 # -- Worker filtering ---------------------------------------------------------
 
 def worker_filter_batch(args: tuple) -> dict:
-    batch_id, mmsi_batch, clean_col, count_matches = args
+    batch_id, mmsi_batch, clean_col = args
 
     t0 = time.perf_counter()
 
-    base_match = [
+    pipeline = [
         {"$match": {"mmsi": {"$in": mmsi_batch}}},
         {"$match": required_field_conditions()},
+        {
+            "$merge": {
+                "into": clean_col,
+                "whenMatched": "keepExisting",
+                "whenNotMatched": "insert",
+            }
+        },
     ]
 
-    matched_docs = None
-
     try:
-        if count_matches:
-            count_pipeline = base_match + [
-                {"$count": "n"}
-            ]
-
-            count_result = aggregate_raw(count_pipeline, use_hint=True)
-            matched_docs = count_result[0]["n"] if count_result else 0
-
-        merge_pipeline = base_match + [
-            {
-                "$merge": {
-                    "into": clean_col,
-                    "whenMatched": "keepExisting",
-                    "whenNotMatched": "insert",
-                }
-            }
-        ]
-
-        aggregate_raw(merge_pipeline, use_hint=True)
+        aggregate_raw(pipeline, use_hint=True)
 
         status = "ok"
         error = None
@@ -549,7 +484,6 @@ def worker_filter_batch(args: tuple) -> dict:
     return {
         "batch_id": batch_id,
         "vessels": len(mmsi_batch),
-        "matched_docs": matched_docs,
         "status": status,
         "error": error,
         "elapsed_s": elapsed,
@@ -567,10 +501,6 @@ def run(
     num_workers: int,
     batch_size: int,
     count_batch_size: int,
-    count_matches: bool,
-    count_valid_pings: bool,
-    shard_clean: bool,
-    create_raw_indexes: bool,
     count_index_name: str,
 ) -> None:
     t0 = time.perf_counter()
@@ -579,40 +509,29 @@ def run(
     batch_size = max(1, batch_size)
     count_batch_size = max(1, count_batch_size)
 
-    if create_raw_indexes:
-        ensure_raw_indexes(
-            uri=uri,
-            db_name=db_name,
-            raw_col=raw_col,
-            count_index_name=count_index_name,
-        )
+    ensure_raw_indexes(
+        uri=uri,
+        db_name=db_name,
+        raw_col=raw_col,
+        count_index_name=count_index_name,
+    )
 
-    hint_name = None
+    hint_name = choose_count_hint(
+        uri=uri,
+        db_name=db_name,
+        raw_col=raw_col,
+        count_index_name=count_index_name,
+    )
 
-    if count_valid_pings:
-        hint_name = choose_count_hint(
-            uri=uri,
-            db_name=db_name,
-            raw_col=raw_col,
-            count_index_name=count_index_name,
-        )
-
-        valid_mmsis = find_valid_mmsis_parallel(
-            uri=uri,
-            db_name=db_name,
-            raw_col=raw_col,
-            min_pings=min_pings,
-            num_workers=num_workers,
-            count_batch_size=count_batch_size,
-            hint_name=hint_name,
-        )
-    else:
-        valid_mmsis = find_valid_mmsis_raw_single(
-            uri=uri,
-            db_name=db_name,
-            raw_col=raw_col,
-            min_pings=min_pings,
-        )
+    valid_mmsis = find_valid_mmsis_parallel(
+        uri=uri,
+        db_name=db_name,
+        raw_col=raw_col,
+        min_pings=min_pings,
+        num_workers=num_workers,
+        count_batch_size=count_batch_size,
+        hint_name=hint_name,
+    )
 
     if not valid_mmsis:
         log.error("No vessels found with >= %d pings. Is data loaded?", min_pings)
@@ -622,7 +541,6 @@ def run(
         uri=uri,
         db_name=db_name,
         clean_col=clean_col,
-        shard_clean=shard_clean,
     )
 
     batches = [
@@ -639,19 +557,13 @@ def run(
         num_workers,
     )
 
-    if count_matches:
-        log.info("Matched-document counting is enabled. This adds extra read work.")
-
     worker_args = [
-        (batch_id, batch, clean_col, count_matches)
+        (batch_id, batch, clean_col)
         for batch_id, batch in enumerate(batches, start=1)
     ]
 
     done = 0
     errors = 0
-    total_matched = 0
-    matched_available = count_matches
-
     batch_times = []
     log_every = max(1, total_batches // 20)
 
@@ -674,15 +586,11 @@ def run(
             else:
                 batch_times.append(result["elapsed_s"])
 
-                if result["matched_docs"] is not None:
-                    total_matched += result["matched_docs"]
-
                 log.info(
-                    "Batch %3d/%d | vessels: %d | matched: %s | time: %.1f s",
+                    "Batch %3d/%d | vessels: %d | time: %.1f s",
                     result["batch_id"],
                     total_batches,
                     result["vessels"],
-                    format_number(result["matched_docs"]),
                     result["elapsed_s"],
                 )
 
@@ -727,10 +635,6 @@ def run(
     log.info("Input vessels:        %d", len(valid_mmsis))
     log.info("Batches:              %d", total_batches)
     log.info("Errors:               %d", errors)
-
-    if matched_available:
-        log.info("Matched docs:          %d", total_matched)
-
     log.info("Clean docs estimate:  %d", clean_count)
     log.info("Time:                 %.1f s", elapsed)
 
@@ -774,30 +678,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--count-matches",
-        action="store_true",
-        help="Count matched documents per filtering batch. Slower.",
-    )
-
-    parser.add_argument(
-        "--count-raw-pings",
-        action="store_true",
-        help="Use raw ping count for min-pings instead of valid ping count.",
-    )
-
-    parser.add_argument(
-        "--no-shard-clean",
-        action="store_true",
-        help="Do not try to shard vessels_clean before writing.",
-    )
-
-    parser.add_argument(
-        "--skip-raw-indexes",
-        action="store_true",
-        help="Skip creating/checking useful indexes on vessels_raw before filtering.",
-    )
-
-    parser.add_argument(
         "--count-index-name",
         default=DEFAULT_COUNT_INDEX_NAME,
         help="Name of the partial index used for valid-ping counting.",
@@ -814,9 +694,5 @@ if __name__ == "__main__":
         num_workers=args.workers,
         batch_size=args.batch_size,
         count_batch_size=args.count_batch_size,
-        count_matches=args.count_matches,
-        count_valid_pings=not args.count_raw_pings,
-        shard_clean=not args.no_shard_clean,
-        create_raw_indexes=not args.skip_raw_indexes,
         count_index_name=args.count_index_name,
     )
