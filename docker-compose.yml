@@ -1,0 +1,132 @@
+# MongoDB Sharded Cluster
+# ========================
+# configsvr  - config server (stores shard metadata)
+# shard1     - first data shard
+# shard2     - second data shard
+# mongos     - query router
+# mongo-init - configures the cluster on first start
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f mongo-init
+#   docker compose down
+#   docker compose down -v              # also deletes all data
+
+services:
+
+  configsvr:
+    image: mongo:7.0
+    container_name: configsvr
+    command: mongod --configsvr --replSet configReplSet --port 27019 --bind_ip_all
+    ports:
+      - "27019:27019"
+    volumes:
+      - configsvr_data:/data/db
+    networks:
+      - mongo-cluster
+    restart: unless-stopped
+
+  shard1:
+    image: mongo:7.0
+    container_name: shard1
+    command: mongod --shardsvr --replSet shard1ReplSet --port 27018 --bind_ip_all
+    ports:
+      - "27018:27018"
+    volumes:
+      - shard1_data:/data/db
+    networks:
+      - mongo-cluster
+    restart: unless-stopped
+
+  shard2:
+    image: mongo:7.0
+    container_name: shard2
+    command: mongod --shardsvr --replSet shard2ReplSet --port 27020 --bind_ip_all
+    ports:
+      - "27020:27020"
+    volumes:
+      - shard2_data:/data/db
+    networks:
+      - mongo-cluster
+    restart: unless-stopped
+
+  mongos:
+    image: mongo:7.0
+    container_name: mongos
+    command: >
+      mongos
+      --configdb configReplSet/configsvr:27019
+      --bind_ip_all
+      --port 27017
+    ports:
+      - "27017:27017"
+    networks:
+      - mongo-cluster
+    depends_on:
+      - configsvr
+      - shard1
+      - shard2
+    restart: unless-stopped
+
+  mongo-init:
+    image: mongo:7.0
+    container_name: mongo-init
+    networks:
+      - mongo-cluster
+    depends_on:
+      - configsvr
+      - shard1
+      - shard2
+      - mongos
+    entrypoint:
+      - bash
+      - -c
+      - |
+        sleep 15 &&
+
+        mongosh --host configsvr --port 27019 --eval '
+          rs.initiate({
+            _id: "configReplSet",
+            configsvr: true,
+            members: [{ _id: 0, host: "configsvr:27019" }]
+          })
+        ' &&
+        sleep 3 &&
+
+        mongosh --host shard1 --port 27018 --eval '
+          rs.initiate({
+            _id: "shard1ReplSet",
+            members: [{ _id: 0, host: "shard1:27018" }]
+          })
+        ' &&
+        sleep 3 &&
+
+        mongosh --host shard2 --port 27020 --eval '
+          rs.initiate({
+            _id: "shard2ReplSet",
+            members: [{ _id: 0, host: "shard2:27020" }]
+          })
+        ' &&
+        sleep 5 &&
+
+        mongosh --host mongos --port 27017 --eval '
+          db.adminCommand({ addShard: "shard1ReplSet/shard1:27018" });
+          db.adminCommand({ addShard: "shard2ReplSet/shard2:27020" });
+        
+          db.adminCommand({ enableSharding: "ais" });
+
+          db.adminCommand({
+            shardCollection: "ais.vessels_raw",
+            key: { mmsi: "hashed" }
+          });
+        '
+    restart: "no"
+
+networks:
+  mongo-cluster:
+    driver: bridge
+
+volumes:
+  configsvr_data:
+  shard1_data:
+  shard2_data:
