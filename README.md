@@ -399,3 +399,8 @@ python filter_vessels.py
 
 python delta_t_histogram.py
 ```
+
+## Presentation of the Solution
+
+Video: https://youtu.be/x3gNXv3Xm8c
+
